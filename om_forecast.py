@@ -20,7 +20,8 @@ FYRF v2 (little-endian; the whole file is raw DEFLATE, like the other .z kinds):
 Grids include both cell edges (rows = 1/dlat + 1), so a point inside the cell interpolates from one file.
 Bytes (255 = no value, e.g. waves on land or outside a regional model):
   1 wind speed 0.5 m/s   2 wind direction (from) 360/255 deg   3 gust 0.5 m/s   4 msl hPa - 900
-  5 precipitation in the hour(s) before the step: 0.1 mm to 10 mm, then 100 + 15 * sqrt(mm - 10)
+  5 precipitation since the step before (a 3- or 6-hourly step holds the 3 or 6 h total): 0.1 mm to 10 mm,
+    then 100 + 15 * sqrt(mm - 10)
   6 CAPE 20 J/kg   7 wave height 0.1 m   8 wave direction (from) 360/255 deg   9 wave period 0.1 s
   10 temperature 2 m 0.5 C from -40 C   11 current speed 0.02 m/s   12 current direction (towards) 360/255 deg
   13 visibility: 100 m to 10 km, then 100 + km - 10 (to 164 km)
@@ -102,7 +103,7 @@ class IFS(O1280):
         u, w = v['wind_u_component_10m'], v['wind_v_component_10m']
         cu, cv = v['ocean_u_current'], v['ocean_v_current']
         return {1: np.hypot(u, w), 2: (np.degrees(np.arctan2(-u, -w)) + 360) % 360, 3: v['wind_gusts_10m'],
-                4: v['pressure_msl'], 5: v['precipitation'], 6: v['cape'], 10: v['temperature_2m'],
+                4: v['pressure_msl'] / 100, 5: v['precipitation'], 6: v['cape'], 10: v['temperature_2m'],   # Pa -> hPa
                 11: np.hypot(cu, cv), 12: (np.degrees(np.arctan2(cu, cv)) + 360) % 360, 13: v['visibility']}
 
 class WAM(O1280):
@@ -463,6 +464,18 @@ def check(outdir, n):
                 if want != got:
                     bad += 1
                     print(f'MISMATCH {name} {model.name} field {f} at {plat:.3f},{plon:.3f} +{steps[s][0]} h: {got} != {want}')
+    # Units: a field pinned at the edge of its byte range is a unit error (IFS pressure came in Pa), not weather.
+    for name in files:
+        _, heads = decode(inflate(open(f'{outdir}/{name}', 'rb').read()))
+        for h in heads:
+            for f, q in h['data'].items():
+                valid = q[q != NONE]
+                if valid.size and (valid == 254).mean() > 0.2:
+                    bad += 1
+                    print(f'CLIPPED {name} model {h["model"]} field {f}: {100 * (valid == 254).mean():.0f}% at the top of the scale')
+                if valid.size and f in (4, 10) and (valid == 0).mean() > 0.2:
+                    bad += 1
+                    print(f'CLIPPED {name} model {h["model"]} field {f}: {100 * (valid == 0).mean():.0f}% at the bottom of the scale')
     print(f'checked {total} values, {bad} mismatches')
     if bad == 0 and total > 0:
         print('FYR_GATE_FORECAST_CELLS_OK')
