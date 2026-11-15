@@ -1,0 +1,58 @@
+name: forecast
+on:
+  schedule:
+    - cron: "20 */3 * * *"     # builds only when a newer IFS run is complete than the published one
+  workflow_dispatch:
+concurrency:
+  group: forecast
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      FYR_S3_ENDPOINT: ${{ secrets.FYR_S3_ENDPOINT }}
+      FYR_BUCKET: ${{ vars.FYR_BUCKET }}
+      FYR_PREFIX: ${{ vars.FYR_PREFIX }}
+      FYR_PUBLIC_INDEX: ${{ vars.FYR_PUBLIC_INDEX }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.FYR_S3_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.FYR_S3_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Newer run?
+        id: newer
+        run: |
+          latest=$(python om_forecast.py latest)
+          published=$(curl -fsS "$FYR_PUBLIC_INDEX" | python -c "import json,sys; print(json.load(sys.stdin)['run'])" || echo none)
+          echo "latest $latest, published $published"
+          if [ "$latest" != "$published" ] || [ "${{ github.event_name }}" = workflow_dispatch ]; then echo "go=1" >> "$GITHUB_OUTPUT"; fi
+      - name: Build
+        if: steps.newer.outputs.go == '1'
+        run: python -u om_forecast.py build out --cells cells.txt --tiles all
+      - name: Check against the source
+        if: steps.newer.outputs.go == '1'
+        run: python -u om_forecast.py check out 60 | tee check.log && grep -q FYR_GATE_FORECAST_CELLS_OK check.log
+      - name: Upload
+        if: steps.newer.outputs.go == '1'
+        run: ./upload.sh out
+  keepalive:
+    # GitHub pauses schedules in a public repo after 60 days without activity: one empty commit a month.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          last=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - last )) -gt $(( 40 * 86400 )) ]; then
+            git config user.name "fyr-forecast bot"; git config user.email "actions@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive" && git push
+          fi
