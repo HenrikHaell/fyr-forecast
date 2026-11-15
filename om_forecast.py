@@ -241,6 +241,45 @@ def fetch_steps(run, stamps, names, sel, shape, reduce=lambda v, i: v, parallel=
     """reduce(variables of a step over sel, step index) for every step, in order; read concurrently on one loop."""
     return asyncio.run(_read_steps(run, stamps, names, sel, shape, reduce, parallel, tries))
 
+def fetch_steps_local(run, stamps, names, sel, shape, reduce, parallel=8, tries=5):
+    """As fetch_steps, but each step file is downloaded whole and read from local disk (ADR-098: range reads cost
+    one round trip each to us-west-2, so a run of ~125 steps x 10 variables is latency-bound; whole files are a few
+    large transfers). Files are deleted as soon as they are read; at most `parallel` are on disk at once."""
+    import shutil, subprocess, tempfile
+    from concurrent.futures import ThreadPoolExecutor
+    scratch = tempfile.mkdtemp(prefix='om-')
+
+    def one(item):
+        i, stamp = item
+        path = f'{scratch}/{i}.om'
+        url = f"{HTTP}/{run.split('/', 1)[1]}/{stamp}.om"
+        for k in range(tries):
+            try:
+                subprocess.run(['curl', '-fsS', '--retry', '3', '-o', path, url], check=True, timeout=900)
+                reader = omfiles.OmFileReader.from_path(path)
+                values = {}
+                for name in names:
+                    try:
+                        child = reader.get_child_by_name(name)
+                    except ValueError:                   # the step lacks it (gusts at +0 h): byte 255
+                        values[name] = np.full(shape, np.nan, np.float32)
+                        continue
+                    values[name] = np.asarray(child.read_array(sel)).reshape(shape)
+                reader.close()
+                return reduce(values, i)
+            except Exception as e:
+                if k == tries - 1:
+                    raise RuntimeError(f'{url}: {e!r}') from e
+                time.sleep(2 ** k)
+            finally:
+                if os.path.exists(path):
+                    os.remove(path)
+    try:
+        with ThreadPoolExecutor(parallel) as pool:
+            return list(pool.map(one, enumerate(stamps)))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
 def fetch(run, stamp, names, sel, shape):
     return fetch_steps(run, [stamp], names, sel, shape, parallel=1)[0]
 
@@ -304,7 +343,7 @@ def build(outdir, units):
             if done[0] % 12 == 0 or done[0] == len(steps):
                 print(f'  {model.name}: {done[0]}/{len(steps)} steps, {time.time() - t0:.0f} s', flush=True)
 
-        fetch_steps(run, [t for _, t in steps], names, sel, shape, reduce)
+        fetch_steps_local(run, [t for _, t in steps], names, sel, shape, reduce)
         at = 0
         for u in used:
             rows, cols, dlat, dlon = grids[u][:4]

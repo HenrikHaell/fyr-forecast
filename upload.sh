@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# upload.sh OUTDIR: the run folder first (immutable), then index.json (short cache), then prune to the newest two runs.
+# upload.sh OUTDIR: the run folder first (immutable), then index.json (short cache), then every older run goes:
+# the host holds only the newest forecast (the app re-reads the index if a run vanishes under it).
 # Needs AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (an R2 token scoped to the bucket), FYR_S3_ENDPOINT, FYR_BUCKET,
 # FYR_PREFIX (for example forecast/v1).
 set -euo pipefail
@@ -11,7 +12,7 @@ $S3 cp --recursive --only-show-errors "$OUT/$RUN" "$DEST/$RUN" \
   --content-type application/octet-stream --cache-control "public, max-age=31536000, immutable"
 $S3 cp --only-show-errors "$OUT/index.json" "$DEST/index.json" \
   --content-type application/json --cache-control "public, max-age=300"
-for old in $($S3 ls "$DEST/" | awk '/PRE [0-9]{10}\// {print $2}' | sort | head -n -2); do
+for old in $($S3 ls "$DEST/" | awk '/PRE [0-9]{10}\// {print $2}' | grep -v "^$RUN/$"); do
   $S3 rm --recursive --only-show-errors "$DEST/$old"
 done
 echo "published run $RUN"
