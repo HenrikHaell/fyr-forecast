@@ -10,6 +10,8 @@ permissions:
   contents: read
 jobs:
   build:
+    # Waits until the storage settings exist (repository variable FYR_BUCKET), so no failing runs before that.
+    if: vars.FYR_BUCKET != ''
     runs-on: ubuntu-latest
     timeout-minutes: 150
     env:
