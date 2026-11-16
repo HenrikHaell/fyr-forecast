@@ -196,6 +196,17 @@ def latest_run(model):
                 return run, ref, meta['valid_times']
     raise SystemExit(f'{model.name}: no completed run in the last 3 days')
 
+def run_at(model, ref_ts):
+    """The run whose reference time is ref_ts (Unix seconds): (prefix, reference datetime, [valid time strings]).
+    check() compares against the run a file was built from, so a newer run published meanwhile does not matter."""
+    ref = datetime.fromtimestamp(ref_ts, timezone.utc)
+    prefix = f'openmeteo/data_spatial/{model.name}/{ref:%Y/%m/%d}/'
+    for run in sorted(p for p in FS.ls(prefix, refresh=True) if p.endswith('Z')):
+        meta = json.load(urllib.request.urlopen(f'{HTTP}/{run.split("/", 1)[1]}/meta.json', timeout=30))
+        if meta.get('reference_time') == f'{ref:%Y-%m-%dT%H:%M:%SZ}':
+            return run, ref, meta['valid_times']
+    raise SystemExit(f'{model.name}: run {ref:%Y-%m-%d %H}Z is gone from the bucket')
+
 def pick_steps(ref, valid, horizon):
     """Every step the run has, up to the horizon: ECMWF is hourly to 90 h, 3-hourly to 144 h, then 6-hourly."""
     out = []
@@ -441,10 +452,9 @@ def check(outdir, n):
         _, heads = decode(inflate(open(f'{outdir}/{name}', 'rb').read()))
         for h in heads:
             model = by_model[h['model']]
-            if model.id not in runs:
-                runs[model.id] = latest_run(model)
-            run, ref, valid = runs[model.id]
-            assert int(ref.timestamp()) == h['ref'], f'{name}: {model.name} run changed since the build; rebuild first'
+            if (model.id, h['ref']) not in runs:
+                runs[model.id, h['ref']] = run_at(model, h['ref'])
+            run, ref, valid = runs[model.id, h['ref']]
             steps = pick_steps(ref, valid, model.horizon)
             p = rng.randrange(h['rows'] * h['cols']); s = rng.randrange(len(steps))
             plat, plon = h['lat0'] + (p // h['cols']) * h['dlat'], h['lon0'] + (p % h['cols']) * h['dlon']
