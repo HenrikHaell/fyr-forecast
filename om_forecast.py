@@ -114,7 +114,12 @@ class WAM(O1280):
 
     @staticmethod
     def values(v):
-        return {7: v['wave_height'], 8: v['wave_direction'], 9: v['wave_period']}
+        # Under sea ice WAM gives a wave height of 0 with a period of 20-40 s: no waves have no period, so the period
+        # is "no value" wherever the height rounds to 0 m (better no data than wrong data). The direction stays: the
+        # app draws a height with its direction, and 0 m in a calm fjord must still read as 0 m, not as a hole.
+        h = np.asarray(v['wave_height'], np.float64)
+        calm = np.isfinite(h) & (h < 0.05)
+        return {7: v['wave_height'], 8: v['wave_direction'], 9: np.where(calm, np.nan, v['wave_period'])}
 
 MODELS = [Nordic, IFS, WAM]
 
