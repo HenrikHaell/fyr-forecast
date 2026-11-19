@@ -7,6 +7,8 @@ coastal 1-degree cells (the chart's coast cells) and 5-degree ocean tiles for pa
   metno_nordic_pp  MET Nordic, 1 km, hourly, ~58 h      -> section 1, cells only, 0.01 x 0.02 degree grid
   ecmwf_ifs        ECMWF IFS HRES, O1280 (~9 km), 10 d  -> section 2, 0.1 degree (cells) / 0.25 (tiles)
   ecmwf_wam        ECMWF WAM waves, O1280, 10 d         -> section 3, as IFS
+  ncep_gfs013      NOAA GFS, 0.117 degree, 15 d (3-hourly) -> section 4, wind only at 0.25 degree: a second
+                   opinion beside ECMWF (where the two agree the forecast is firmer; ADR-114)
 
 Output: OUTDIR/<run id>/c_<lat>_<lon>.fyrf.z (cells), OUTDIR/<run id>/o_<lat>_<lon>.fyrf.z (tiles, named by
 their south-west corner, multiples of 5) and OUTDIR/index.json (written last: run id, model runs, units).
@@ -125,7 +127,28 @@ class WAM(O1280):
         ghost = np.isfinite(h) & ((h < 0.05) | ((h < 0.5) & (t >= 25.35)))
         return {7: v['wave_height'], 8: v['wave_direction'], 9: np.where(ghost, np.nan, v['wave_period'])}
 
-MODELS = [Nordic, IFS, WAM]
+class GFS:
+    """NOAA GFS on its 3072 x 1536 grid (row 0 = south, column 0 = 180 W), wind only, every third hour: the
+    second model beside ECMWF. Public domain (U.S. Government work), read from Open-Meteo's bucket."""
+    id, name, dlat, dlon, horizon, reach, every = 4, 'ncep_gfs013', 0.25, 0.25, 360, 360, 3
+    fields = [1, 2]
+    nx, ny = 3072, 1536
+    lat0, lat1 = -89.912125, 89.912125
+
+    @classmethod
+    def index(cls, lat, lon):
+        j = np.round((np.asarray(lat) - cls.lat0) / (cls.lat1 - cls.lat0) * (cls.ny - 1)).astype(int)
+        i = np.round(((np.asarray(lon) + 180) % 360) / (360 / cls.nx)).astype(int) % cls.nx
+        return np.clip(j, 0, cls.ny - 1), i
+
+    variables = ['wind_u_component_10m', 'wind_v_component_10m']
+
+    @staticmethod
+    def values(v):
+        u, w = v['wind_u_component_10m'], v['wind_v_component_10m']
+        return {1: np.hypot(u, w), 2: (np.degrees(np.arctan2(-u, -w)) + 360) % 360}
+
+MODELS = [Nordic, IFS, WAM, GFS]
 
 # MARK: quantisation
 
@@ -216,13 +239,16 @@ def run_at(model, ref_ts):
             return run, ref, meta['valid_times']
     raise SystemExit(f'{model.name}: run {ref:%Y-%m-%d %H}Z is gone from the bucket')
 
-def pick_steps(ref, valid, horizon):
-    """Every step the run has, up to the horizon: ECMWF is hourly to 90 h, 3-hourly to 144 h, then 6-hourly."""
+def pick_steps(ref, valid, horizon, every=1):
+    """Every step the run has, up to the horizon: ECMWF is hourly to 90 h, 3-hourly to 144 h, then 6-hourly.
+    `every`: only hours that are its multiples (GFS: every third)."""
     out = []
     for t in valid:
         h = round((datetime.strptime(t, '%Y-%m-%dT%H:%MZ').replace(tzinfo=timezone.utc) - ref).total_seconds() / 3600)
         if h > horizon:
             break
+        if h % every:
+            continue
         out.append((h, t.replace(':', '').replace('Z', '')))
     return out
 
@@ -325,20 +351,20 @@ def build(outdir, units):
     runs = {}
     for model in MODELS:
         run, ref, valid = latest_run(model)
-        steps = pick_steps(ref, valid, model.horizon)
+        steps = pick_steps(ref, valid, model.horizon, getattr(model, 'every', 1))
         runs[model.name] = ref
         t0 = time.time()
         used = [u for u in units if model is not Nordic or u[2] == 1]
         grids = {u: unit_grid(model, u) for u in used}
-        if model is Nordic:
-            idx = {u: Nordic.index(g[4], g[5]) for u, g in grids.items()}
+        if hasattr(model, 'nx'):                                             # a 2-D grid: MET Nordic, GFS
+            idx = {u: model.index(g[4], g[5]) for u, g in grids.items()}
             used = [u for u in used if (idx[u][0] >= 0).mean() >= 0.5]       # cells mostly inside the domain
             if not used:
                 print(f'{model.name}: no cell inside the domain'); continue
             J = np.concatenate([idx[u][0] for u in used]); I = np.concatenate([idx[u][1] for u in used])
             inside = J >= 0
             j0, j1, i0, i1 = J[inside].min(), J[inside].max() + 1, I[inside].min(), I[inside].max() + 1
-            names, sel, shape = Nordic.variables, (slice(j0, j1), slice(i0, i1)), (j1 - j0, i1 - i0)
+            names, sel, shape = model.variables, (slice(j0, j1), slice(i0, i1)), (j1 - j0, i1 - i0)
             jj, ii = np.maximum(J, 0) - j0, np.maximum(I, 0) - i0
 
             def pick(w, f):
@@ -395,7 +421,7 @@ def build(outdir, units):
              'models': {k: v.strftime('%Y-%m-%dT%H:%M:%SZ') for k, v in runs.items()},
              'tileSize': TILE, 'cells': sorted(written['cells']), 'tiles': sorted(written['tiles']),
              'bytes': int(sum(sizes)),
-             'attribution': 'Open-Meteo.com (CC BY 4.0): ECMWF IFS and WAM, MET Norway MET Nordic'}
+             'attribution': 'Open-Meteo.com (CC BY 4.0): ECMWF IFS and WAM, MET Norway MET Nordic, NOAA GFS'}
     with open(f'{outdir}/index.json.tmp', 'w') as fh:
         json.dump(index, fh, separators=(',', ':'))
     os.replace(f'{outdir}/index.json.tmp', f'{outdir}/index.json')
@@ -464,15 +490,15 @@ def check(outdir, n):
             if (model.id, h['ref']) not in runs:
                 runs[model.id, h['ref']] = run_at(model, h['ref'])
             run, ref, valid = runs[model.id, h['ref']]
-            steps = pick_steps(ref, valid, model.horizon)
+            steps = pick_steps(ref, valid, model.horizon, getattr(model, 'every', 1))
             p = rng.randrange(h['rows'] * h['cols']); s = rng.randrange(len(steps))
             plat, plon = h['lat0'] + (p // h['cols']) * h['dlat'], h['lon0'] + (p % h['cols']) * h['dlon']
-            if model is Nordic:
-                j, i = Nordic.index(np.array([plat]), np.array([plon]))
+            if hasattr(model, 'nx'):
+                j, i = model.index(np.array([plat]), np.array([plon]))
                 if j[0] < 0:
                     continue
                 sel = (slice(int(j[0]), int(j[0]) + 1), slice(int(i[0]), int(i[0]) + 1))
-                vals = Nordic.values(fetch(run, steps[s][1], Nordic.variables, sel, (1,)))
+                vals = model.values(fetch(run, steps[s][1], model.variables, sel, (1,)))
             else:
                 k = int(model.index(np.array([plat]), np.array([plon]))[0])
                 vals = model.values(fetch(run, steps[s][1], model.variables, (slice(0, 1), slice(k, k + 1)), (1,)))
