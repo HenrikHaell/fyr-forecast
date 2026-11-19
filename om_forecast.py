@@ -114,12 +114,16 @@ class WAM(O1280):
 
     @staticmethod
     def values(v):
-        # Under sea ice WAM gives a wave height of 0 with a period of 20-40 s: no waves have no period, so the period
-        # is "no value" wherever the height rounds to 0 m (better no data than wrong data). The direction stays: the
-        # app draws a height with its direction, and 0 m in a calm fjord must still read as 0 m, not as a hole.
+        # Under sea ice WAM gives waves of 0-0.16 m with a period of 25-40 s, onto or past the top byte (25.4 s): a ghost of
+        # swell, not weather. The period is "no value" wherever the height rounds to 0 m, and wherever it runs off the
+        # scale under waves lower than 0.5 m (better no data than wrong data; 2026111900 had 100 % of some Ross Sea
+        # tiles pinned at heights up to 0.16 m). Off the scale under real waves it still clips and trips the gate: that
+        # is a unit error. The direction stays: the app draws a height with its direction, and 0 m in a calm fjord
+        # must still read as 0 m, not as a hole.
         h = np.asarray(v['wave_height'], np.float64)
-        calm = np.isfinite(h) & (h < 0.05)
-        return {7: v['wave_height'], 8: v['wave_direction'], 9: np.where(calm, np.nan, v['wave_period'])}
+        t = np.asarray(v['wave_period'], np.float64)
+        ghost = np.isfinite(h) & ((h < 0.05) | ((h < 0.5) & (t >= 25.35)))
+        return {7: v['wave_height'], 8: v['wave_direction'], 9: np.where(ghost, np.nan, v['wave_period'])}
 
 MODELS = [Nordic, IFS, WAM]
 
