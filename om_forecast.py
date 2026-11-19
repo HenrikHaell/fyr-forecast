@@ -92,7 +92,7 @@ class O1280:
         return cls._off[k] + c
 
 class IFS(O1280):
-    id, name, dlat, dlon, horizon, reach = 2, 'ecmwf_ifs', 0.1, 0.1, 240, 240
+    id, name, dlat, dlon, horizon, reach = 2, 'ecmwf_ifs', 0.1, 0.1, 360, 360
     fields = [1, 2, 3, 4, 5, 6, 10, 11, 12, 13]
 
     variables = ['wind_u_component_10m', 'wind_v_component_10m', 'wind_gusts_10m', 'pressure_msl',
@@ -107,7 +107,7 @@ class IFS(O1280):
                 11: np.hypot(cu, cv), 12: (np.degrees(np.arctan2(cu, cv)) + 360) % 360, 13: v['visibility']}
 
 class WAM(O1280):
-    id, name, dlat, dlon, horizon, reach = 3, 'ecmwf_wam', 0.1, 0.1, 240, 240
+    id, name, dlat, dlon, horizon, reach = 3, 'ecmwf_wam', 0.1, 0.1, 360, 360
     fields = [7, 8, 9]
 
     variables = ['wave_height', 'wave_direction', 'wave_period']
@@ -201,7 +201,7 @@ def latest_run(model):
                 ref = datetime.strptime(meta['reference_time'], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
                 last = datetime.strptime(meta['valid_times'][-1], '%Y-%m-%dT%H:%MZ').replace(tzinfo=timezone.utc)
                 if (last - ref).total_seconds() / 3600 < model.reach:
-                    continue        # ECMWF's 06/18 UTC runs stop at 144 h: take the last 00/12 UTC run instead
+                    continue        # ECMWF's 06/18 UTC runs stop at 144 h, the 00/12 UTC runs reach 360 h (15 days, ADR-112): take the last 00/12 run
                 return run, ref, meta['valid_times']
     raise SystemExit(f'{model.name}: no completed run in the last 3 days')
 
