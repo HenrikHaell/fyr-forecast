@@ -11,7 +11,12 @@ coastal 1-degree cells (the chart's coast cells) and 5-degree ocean tiles for pa
                    opinion beside ECMWF (where the two agree the forecast is firmer; ADR-114)
 
 Output: OUTDIR/<run id>/c_<lat>_<lon>.fyrf.z (cells), OUTDIR/<run id>/o_<lat>_<lon>.fyrf.z (tiles, named by
-their south-west corner, multiples of 5) and OUTDIR/index.json (written last: run id, model runs, units).
+their south-west corner, multiples of 5), OUTDIR/<run id>/r_<lat>_<lon>.fyrf.z (routing tiles, see below) and
+OUTDIR/index.json (written last: run id, model runs, units).
+
+Routing tiles (ADR-116): 20 degrees at 1 degree, every third hour: wind and current (IFS), the sea (WAM) and the
+second model's wind (GFS). What a search for a way across an ocean reads: a crossing is a handful of files of about 100 kB instead of a
+hundred ocean tiles.
 
 FYRF v2 (little-endian; the whole file is raw DEFLATE, like the other .z kinds):
   "FYRF" | u8 version=2 | i16 lat | i16 lon | u8 size (degrees: 1 cell, 5 tile) | u8 nSections
@@ -43,6 +48,8 @@ HTTP = 'https://openmeteo.s3.amazonaws.com'
 FS = fsspec.filesystem('s3', anon=True)          # listings; data reads use an async client per step
 MAGIC, VERSION = b'FYRF', 2
 TILE, TILE_D = 5, 0.25                          # ocean tiles: 5 degrees at 0.25 degree
+ROUTE, ROUTE_D, ROUTE_EVERY = 20, 1.0, 3        # routing tiles: 20 degrees at 1 degree, every third hour
+ROUTE_FIELDS = {2: [1, 2, 11, 12], 3: [7, 8, 9], 4: [1, 2]}   # by model id: IFS wind and current, WAM, GFS wind
 NONE = 255
 KN = 1.943844
 
@@ -334,12 +341,12 @@ def fetch(run, stamp, names, sel, shape):
 
 def unit_name(unit):
     lat, lon, size = unit
-    return f"{'c' if size == 1 else 'o'}_{lat}_{lon}"
+    return f"{'c' if size == 1 else 'r' if size == ROUTE else 'o'}_{lat}_{lon}"
 
 def unit_grid(model, unit):
     """rows, cols and the point coordinates (row 0 = south, both edges included) of a unit for a model."""
     lat, lon, size = unit
-    dlat, dlon = (model.dlat, model.dlon) if size == 1 else (TILE_D, TILE_D)
+    dlat, dlon = (model.dlat, model.dlon) if size == 1 else (ROUTE_D, ROUTE_D) if size == ROUTE else (TILE_D, TILE_D)
     rows, cols = int(round(size / dlat)) + 1, int(round(size / dlon)) + 1
     la = lat + dlat * np.arange(rows)
     lo = lon + dlon * np.arange(cols)
@@ -354,7 +361,7 @@ def build(outdir, units):
         steps = pick_steps(ref, valid, model.horizon, getattr(model, 'every', 1))
         runs[model.name] = ref
         t0 = time.time()
-        used = [u for u in units if model is not Nordic or u[2] == 1]
+        used = [u for u in units if (model is not Nordic or u[2] == 1) and (u[2] != ROUTE or model.id in ROUTE_FIELDS)]
         grids = {u: unit_grid(model, u) for u in used}
         if hasattr(model, 'nx'):                                             # a 2-D grid: MET Nordic, GFS
             idx = {u: model.index(g[4], g[5]) for u, g in grids.items()}
@@ -399,15 +406,20 @@ def build(outdir, units):
             at += n
             if model is WAM and all((q == NONE).all() for _, q in fields):
                 continue                                                     # all land
+            if u[2] == ROUTE:                                                # fewer fields, every third hour
+                keep = [i for i, (h, _) in enumerate(steps) if h % ROUTE_EVERY == 0]
+                fields = [(f, q[:, keep]) for f, q in fields if f in ROUTE_FIELDS[model.id]]
+                sections[u].append((model, ref, [steps[i] for i in keep], rows, cols, dlat, dlon, fields))
+                continue
             sections[u].append((model, ref, steps, rows, cols, dlat, dlon, fields))
         print(f'{model.name}: run {ref:%Y-%m-%d %H}Z, {len(steps)} steps (to +{steps[-1][0]} h), {len(used)} units, '
               f'{npts} points, {time.time() - t0:.0f} s', flush=True)
     run_id = runs['ecmwf_ifs'].strftime('%Y%m%d%H')
     folder = f'{outdir}/{run_id}'
     os.makedirs(folder, exist_ok=True)
-    sizes, written = [], {'cells': [], 'tiles': []}
+    sizes, written = [], {'cells': [], 'tiles': [], 'routing': []}
     for u, secs in sections.items():
-        if not secs or (u[2] == TILE and not any(m is WAM for m, *_ in secs)):
+        if not secs or (u[2] != 1 and not any(m is WAM for m, *_ in secs)):
             continue                                                         # nothing, or a land-only tile
         z = deflate(encode(u, secs))
         path = f'{folder}/{unit_name(u)}.fyrf.z'
@@ -415,17 +427,18 @@ def build(outdir, units):
             fh.write(z)
         os.replace(path + '.tmp', path)
         sizes.append(len(z))
-        written['cells' if u[2] == 1 else 'tiles'].append(f'{u[0]}_{u[1]}')
+        written['cells' if u[2] == 1 else 'routing' if u[2] == ROUTE else 'tiles'].append(f'{u[0]}_{u[1]}')
     index = {'format': 'FYRF', 'version': VERSION, 'run': run_id,
              'generatedAt': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
              'models': {k: v.strftime('%Y-%m-%dT%H:%M:%SZ') for k, v in runs.items()},
              'tileSize': TILE, 'cells': sorted(written['cells']), 'tiles': sorted(written['tiles']),
+             'routingSize': ROUTE, 'routing': sorted(written['routing']),
              'bytes': int(sum(sizes)),
              'attribution': 'Open-Meteo.com (CC BY 4.0): ECMWF IFS and WAM, MET Norway MET Nordic, NOAA GFS'}
     with open(f'{outdir}/index.json.tmp', 'w') as fh:
         json.dump(index, fh, separators=(',', ':'))
     os.replace(f'{outdir}/index.json.tmp', f'{outdir}/index.json')
-    print(f"{len(written['cells'])} cells + {len(written['tiles'])} tiles, {sum(sizes) / 1e6:.1f} MB, "
+    print(f"{len(written['cells'])} cells + {len(written['tiles'])} tiles + {len(written['routing'])} routing tiles, {sum(sizes) / 1e6:.1f} MB, "
           f'median {np.median(sizes) / 1e3:.0f} kB, max {max(sizes) / 1e3:.0f} kB, run {run_id}')
     return run_id
 
@@ -490,7 +503,8 @@ def check(outdir, n):
             if (model.id, h['ref']) not in runs:
                 runs[model.id, h['ref']] = run_at(model, h['ref'])
             run, ref, valid = runs[model.id, h['ref']]
-            steps = pick_steps(ref, valid, model.horizon, getattr(model, 'every', 1))
+            stamp = dict(pick_steps(ref, valid, model.horizon, getattr(model, 'every', 1)))
+            steps = [(hour, stamp[hour]) for hour in h['hours']]          # the unit's own steps (routing tiles keep every third hour)
             p = rng.randrange(h['rows'] * h['cols']); s = rng.randrange(len(steps))
             plat, plon = h['lat0'] + (p // h['cols']) * h['dlat'], h['lon0'] + (p % h['cols']) * h['dlon']
             if hasattr(model, 'nx'):
@@ -553,6 +567,7 @@ def main():
         if a.tiles or a.tiles_box:
             la0, la1, lo0, lo1 = a.tiles_box or (-80, 85, -180, 180)     # WindGrid.latitudeLimit is 85
             units += [(la, lo, TILE) for la in range(la0 - la0 % TILE, la1, TILE) for lo in range(lo0 - lo0 % TILE, lo1, TILE)]
+            units += [(la, lo, ROUTE) for la in range(la0 - la0 % ROUTE, la1, ROUTE) for lo in range(lo0 - lo0 % ROUTE, lo1, ROUTE)]
         if not units:
             sys.exit('--cells/--box and/or --tiles/--tiles-box')
         build(a.outdir, units)
