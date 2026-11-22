@@ -529,7 +529,11 @@ def check(outdir, n):
         for h in heads:
             for f, q in h['data'].items():
                 valid = q[q != NONE]
-                if valid.size and (valid == 254).mean() > 0.2:
+                # CAPE reaches the top byte (5080 J/kg) in real weather: the IFS gave a median of 4440 and a peak of 6580
+                # J/kg off northern Australia in the build-up to the wet season (2026112100, 2026112200: c_-15_128 at
+                # 20-22 % stopped both builds). Above 5000 the thunder risk reads the same, so only a field pinned
+                # almost everywhere is taken for a unit error.
+                if valid.size and (valid == 254).mean() > (0.9 if f == 6 else 0.2):
                     bad += 1
                     print(f'CLIPPED {name} model {h["model"]} field {f}: {100 * (valid == 254).mean():.0f}% at the top of the scale')
                 if valid.size and f in (4, 10) and (valid == 0).mean() > 0.2:
