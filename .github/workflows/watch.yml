@@ -1,0 +1,17 @@
+name: watch
+# The alarm: fails, and so sends GitHub's failure notice, when the published forecast is over 30 h old or the
+# pack manifest or the website does not answer. Independent of the build job, which can fail or not fire at all.
+on:
+  schedule:
+    - cron: "47 */2 * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 watch.py selftest
+      - run: python3 watch.py
